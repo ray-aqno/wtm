@@ -76,7 +76,9 @@ pub enum SwitchAction {
     PrintPath(std::path::PathBuf),
 }
 
-/// Guarded removal. Returns the recorded recovery SHA on success.
+/// Guarded removal. Snapshots uncommitted work to a durable recovery ref and
+/// records it BEFORE the worktree is removed, so nothing is lost if the removal
+/// or the log write fails.
 pub fn guarded_remove(
     repo: &Path,
     wt: &Worktree,
@@ -88,24 +90,28 @@ pub fn guarded_remove(
     assert!(wt.path.is_absolute(), "worktree path must be absolute");
     assert!(log_path.is_absolute(), "log path must be absolute");
 
-    // Re-validate identity right before the destructive call (Safety Car #13).
+    // Re-validate identity and read FRESH status right before acting, rather
+    // than trusting the possibly-stale list-time snapshot (Greptile #4, #13).
     if !wt.path.exists() {
         return Err(Error::NotFound(format!(
             "worktree gone: {}",
             wt.path.display()
         )));
     }
+    let dirty = fresh_dirty(repo, &wt.path, timeout)?;
 
-    if !wt.is_clean() && !force {
+    if dirty && !force {
         return Err(Error::Invalid(
             "worktree is dirty; pass --force (work will be snapshotted)".into(),
         ));
     }
 
-    // Snapshot uncommitted work before a forced removal (Safety Car #3).
-    let stash_ref = if !wt.is_clean() {
-        match snapshot(repo, &wt.path, timeout) {
-            Ok(sha) => Some(sha),
+    // Snapshot uncommitted work (tracked AND untracked) to a durable ref BEFORE
+    // removal (Greptile #2, #3, #7). If a snapshot can't be made and the user
+    // did not accept the loss, refuse.
+    let stash_ref = if dirty {
+        match snapshot(repo, wt, timeout) {
+            Ok(r) => Some(r),
             Err(_) if confirm_unrecoverable => None,
             Err(e) => return Err(e),
         }
@@ -113,41 +119,51 @@ pub fn guarded_remove(
         None
     };
 
-    let head = wt.head.clone();
-
-    git::remove_worktree(repo, &wt.path, force)?;
-
+    // Record the recovery entry first; the ref already protects the data.
     recovery::record(
         log_path,
         &Entry {
             branch: wt.branch.as_deref().unwrap_or("(detached)"),
-            sha: &head,
+            sha: &wt.head,
             path: &wt.path,
             stash_ref: stash_ref.as_deref(),
         },
     )?;
+
+    git::remove_worktree(repo, &wt.path, force)?;
     Ok(())
 }
 
-/// Create a recovery stash commit object for uncommitted work without touching
-/// the worktree state. Returns the created object SHA.
-fn snapshot(repo: &Path, path: &Path, timeout: Duration) -> Result<String> {
-    let path_str = path.to_string_lossy().into_owned();
-    let sha = git_capture(
-        repo,
-        &["-C", &path_str, "stash", "create", "wtm recovery"],
-        timeout,
-    )?;
-    let sha = sha.trim().to_string();
-    if sha.is_empty() {
-        return Err(Error::Git("nothing to snapshot".into()));
+/// Read the worktree's current dirty state, failing closed: an unreadable
+/// status is treated as "assume dirty" so `--force` can't skip the snapshot on
+/// a status that merely failed to read (Greptile #4).
+fn fresh_dirty(repo: &Path, path: &Path, timeout: Duration) -> Result<bool> {
+    match git::dirty_count(repo, path, timeout) {
+        Ok(n) => Ok(n > 0),
+        Err(_) => Ok(true),
     }
-    Ok(sha)
 }
 
-/// Thin read-only capture wrapper used by the snapshot path.
-fn git_capture(repo: &Path, args: &[&str], timeout: Duration) -> Result<String> {
-    // `stash create` does not mutate the working tree or refs; it only writes a
-    // dangling commit object, so it is safe on the read-timeout path.
-    git::capture_read(repo, args, timeout)
+/// Snapshot uncommitted work (tracked AND untracked) to a durable ref so git
+/// cannot GC it (Greptile #2, #3). Delegates to `git::snapshot_worktree`, which
+/// uses a scratch index + `commit-tree` so untracked-only state is captured too
+/// (plain `stash create` would silently drop it). Returns the ref name, or an
+/// error if there was genuinely nothing to snapshot. `timeout` is unused here
+/// because snapshot steps are mutating and run to completion off the kill path.
+fn snapshot(repo: &Path, wt: &Worktree, _timeout: Duration) -> Result<String> {
+    let refname = recovery_ref_name(wt);
+    match git::snapshot_worktree(repo, &wt.path, &refname)? {
+        Some(_sha) => Ok(refname),
+        None => Err(Error::Git("nothing to snapshot".into())),
+    }
+}
+
+/// A unique, legal recovery ref name for a worktree.
+fn recovery_ref_name(wt: &Worktree) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hash = fnv1a(wt.path.to_string_lossy().as_bytes());
+    format!("refs/wtm-recovery/{ts}-{hash:08x}")
 }

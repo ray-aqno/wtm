@@ -1,7 +1,8 @@
 //! Rendering: turn app state into a ratatui frame.
 //!
-//! Kept pure w.r.t. the terminal so the headless `TestBackend` test can render
-//! a fixture model and assert on the buffer (P10 Rule 6 — no hidden state).
+//! Render reads a `&mut App` only to drive the stateful `TableState`, which
+//! carries selection and scroll offset. It makes no other mutation, so the
+//! headless `TestBackend` test can still render a fixture and assert the buffer.
 
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
@@ -13,11 +14,18 @@ use crate::app::App;
 use crate::model::Worktree;
 use crate::refresh::WatchMode;
 
-/// Render the whole dashboard into `frame`.
-pub fn render(frame: &mut Frame<'_>, app: &App) {
+/// Render the whole dashboard into `frame`. Takes `&mut App` so the table's
+/// selection/scroll state (Greptile #10) is applied.
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(frame.area());
     frame.render_widget(header_line(app), chunks[0]);
-    frame.render_widget(worktree_table(app), chunks[1]);
+    let table = worktree_table(app);
+    app.table_state.select(if app.worktrees.is_empty() {
+        None
+    } else {
+        Some(app.selected.min(app.worktrees.len() - 1))
+    });
+    frame.render_stateful_widget(table, chunks[1], &mut app.table_state);
 }
 
 /// The one-line header: title, watch mode, and a truncation banner if the cap
@@ -36,14 +44,15 @@ fn header_line(app: &App) -> Line<'static> {
 
 /// The worktree table widget.
 fn worktree_table(app: &App) -> Table<'static> {
-    let header = Row::new(["branch", "status", "±", "agent"])
+    let header = Row::new(["branch", "status", "±", "activity", "agent"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app.worktrees.iter().map(worktree_row).collect();
     let widths = [
-        Constraint::Percentage(40),
+        Constraint::Percentage(32),
         Constraint::Length(10),
         Constraint::Length(10),
-        Constraint::Percentage(30),
+        Constraint::Length(12),
+        Constraint::Percentage(26),
     ];
     Table::new(rows, widths)
         .header(header)
@@ -65,6 +74,10 @@ fn worktree_row(wt: &Worktree) -> Row<'static> {
         Some(ab) => format!("+{} -{}", ab.ahead, ab.behind),
         None => "n/a".to_string(),
     };
+    let activity = match wt.last_activity {
+        Some(ts) => format_age(ts),
+        None => "—".to_string(),
+    };
     let agent = match &wt.agent {
         Some(a) => format!("{} ({})", a.label, a.pid),
         None => "—".to_string(),
@@ -73,6 +86,29 @@ fn worktree_row(wt: &Worktree) -> Row<'static> {
         Cell::from(branch),
         Cell::from(status),
         Cell::from(ab),
+        Cell::from(activity),
         Cell::from(agent),
     ])
+}
+
+/// A compact relative age ("3m", "2h", "5d") from a unix timestamp
+/// (Greptile #14). Falls back to "—" for a future/invalid timestamp.
+fn format_age(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = now - ts;
+    if secs < 0 {
+        return "—".to_string();
+    }
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }

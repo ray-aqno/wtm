@@ -33,9 +33,11 @@ pub struct Refresher {
 }
 
 impl Refresher {
-    /// Build a refresher watching `root`. Never fails: a watcher error degrades
-    /// to poll-only.
-    pub fn new(root: &Path, interval: Duration) -> Self {
+    /// Build a refresher that watches the repository and the worktrees root
+    /// recursively, so edits inside any worktree and changes in the main repo
+    /// trigger a refresh (Greptile #13). Never fails: a watcher error (or a
+    /// mount without inotify) degrades to poll-only and is reported via `mode`.
+    pub fn new(repo: &Path, worktrees_root: &Path, interval: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let watcher = RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
@@ -46,8 +48,15 @@ impl Refresher {
             },
             notify::Config::default(),
         );
+        // Watch both the repo (its .git and tracked tree) and the worktrees
+        // root recursively. Success on EITHER target counts as live events; a
+        // missing worktrees root (none created yet) is fine.
         let watched = watcher.and_then(|mut w| {
-            w.watch(root, RecursiveMode::NonRecursive)?;
+            let a = w.watch(repo, RecursiveMode::Recursive);
+            let b = w.watch(worktrees_root, RecursiveMode::Recursive);
+            if a.is_err() && b.is_err() {
+                return Err(a.err().unwrap());
+            }
             Ok(w)
         });
         match watched {

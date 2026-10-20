@@ -39,7 +39,8 @@ fn run() -> Result<()> {
         }
         Some(Command::Path { branch }) => {
             let seg = git::validate_branch_name(&branch)?;
-            println!("{}", config.worktree_path_for(seg).display());
+            let wt = git::find_by_branch(&repo, seg, timeout)?;
+            println!("{}", wt.path.display());
             Ok(())
         }
         Some(Command::Rm {
@@ -47,13 +48,8 @@ fn run() -> Result<()> {
             force,
             confirm_unrecoverable,
         }) => {
-            let (worktrees, _) = git::list_worktrees(&repo, timeout)?;
             let seg = git::validate_branch_name(&branch)?;
-            let target = config.worktree_path_for(seg);
-            let wt = worktrees
-                .into_iter()
-                .find(|w| w.path == target || w.branch.as_deref() == Some(&branch))
-                .ok_or_else(|| wtm::error::Error::NotFound(format!("no worktree for {branch}")))?;
+            let wt = git::find_by_branch(&repo, seg, timeout)?;
             let log = recovery_log_path();
             switch::guarded_remove(&repo, &wt, &log, force, confirm_unrecoverable, timeout)?;
             println!("removed {}", wt.path.display());

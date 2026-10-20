@@ -916,6 +916,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "libc",
  "notify",
  "ratatui",
  "tempfile",

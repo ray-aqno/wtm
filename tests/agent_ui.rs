@@ -31,7 +31,6 @@ fn headless_render_shows_worktrees_and_truncation() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use wtm::app::App;
-    use wtm::config::Config;
     use wtm::model::{AheadBehind, Worktree};
     use wtm::refresh::WatchMode;
 
@@ -48,16 +47,11 @@ fn headless_render_shows_worktrees_and_truncation() {
         reachable: true,
         agent: None,
     };
-    let app = App::for_render(
-        vec![wt],
-        true,
-        WatchMode::PollOnly,
-        Config::for_repo(&PathBuf::from("/repo")),
-    );
+    let mut app = App::for_render(vec![wt], true, WatchMode::PollOnly);
 
     let backend = TestBackend::new(80, 10);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| wtm::ui::render(f, &app)).unwrap();
+    terminal.draw(|f| wtm::ui::render(f, &mut app)).unwrap();
     let text = buffer_text(terminal.backend().buffer());
     assert!(text.contains("main"), "branch rendered");
     assert!(text.contains("poll-only"), "poll-only indicator rendered");

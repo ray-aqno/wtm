@@ -97,17 +97,31 @@ struct Lock {
 }
 
 impl Lock {
+    /// Acquire an exclusive lock via `O_CREAT|O_EXCL` (atomic create-if-absent):
+    /// the open fails if the lock file already exists, so two writers cannot
+    /// both proceed (Greptile #6). Retries briefly, then steals a stale lock so
+    /// a crashed process does not deadlock a solo user forever.
     fn acquire(log_path: &Path) -> Result<Lock> {
         let mut s = log_path.as_os_str().to_os_string();
         s.push(".lock");
         let path = PathBuf::from(s);
-        // Best-effort: if a stale lock exists, overwrite it rather than deadlock
-        // a solo user. Exclusivity here guards against the same process racing
-        // itself across threads, which is the realistic case.
-        let _ = OpenOptions::new()
-            .create(true)
+        // Bounded retry (P10 Rule 2): ~1s total before stealing.
+        const MAX_ATTEMPTS: u32 = 100;
+        for _ in 0..MAX_ATTEMPTS {
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(_) => return Ok(Lock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Presumed stale: remove and take it. One more create_new; if that still
+        // races, surface the error rather than clobbering.
+        let _ = fs::remove_file(&path);
+        OpenOptions::new()
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&path)?;
         Ok(Lock { path })
     }

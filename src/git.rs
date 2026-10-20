@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::caps::{MAX_PORCELAIN_RECORDS, MAX_WORKTREES};
 use crate::error::{Error, Result};
-use crate::model::{AheadBehind, Worktree};
+use crate::model::Worktree;
 
 mod parse;
 mod proc;
@@ -77,16 +77,23 @@ pub fn validate_branch_name(name: &str) -> Result<&str> {
 /// Create a worktree for `branch` under `root`, returning its path.
 ///
 /// Mutating op: runs WITHOUT the kill-on-timeout path. On failure it prunes the
-/// admin stub and deletes the just-created branch so a retry with the same name
-/// is not blocked (Safety Car #11).
+/// admin stub and deletes the branch ONLY if this call created it, so a
+/// pre-existing branch is never destroyed (Greptile #1).
 pub fn add_worktree(repo: &Path, root: &Path, branch: &str) -> Result<PathBuf> {
     let branch = validate_branch_name(branch)?;
     let path = safe_worktree_path(root, branch)?;
     assert!(path.is_absolute(), "derived worktree path must be absolute");
-    assert!(
-        !path.exists(),
-        "derived worktree path must not already exist"
-    );
+    if path.exists() {
+        // Routine user conflict, not an internal invariant: report it (Greptile
+        // #17) rather than panicking on an assertion.
+        return Err(Error::Invalid(format!(
+            "destination already exists: {}",
+            path.display()
+        )));
+    }
+    // Did the branch already exist before we tried? If so, a failed add must not
+    // delete it during cleanup.
+    let pre_existing = branch_exists(repo, branch);
     let path_str = path.to_string_lossy().into_owned();
     // `--` separates options from the path operand (Safety Car #1) so the path
     // can never be read as a flag; `-b <branch>` precedes it and `branch` is
@@ -95,27 +102,38 @@ pub fn add_worktree(repo: &Path, root: &Path, branch: &str) -> Result<PathBuf> {
     match proc::run_mutate(repo, &add) {
         Ok(_) => Ok(path),
         Err(e) => {
-            cleanup_failed_add(repo, branch);
+            cleanup_failed_add(repo, branch, pre_existing);
             Err(e)
         }
     }
 }
 
+/// True if a local branch already exists.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let refname = format!("refs/heads/{branch}");
+    proc::run_mutate(repo, &["show-ref", "--verify", "--quiet", "--", &refname]).is_ok()
+}
+
 /// Best-effort cleanup after a failed `worktree add` (Safety Car #11). Errors
-/// here are intentionally swallowed: this is recovery, not a primary op.
-fn cleanup_failed_add(repo: &Path, branch: &str) {
+/// here are intentionally swallowed: this is recovery, not a primary op. The
+/// branch is deleted only when this call is the one that could have created it
+/// (`pre_existing == false`), and with `-d` (safe) so unmerged commits block
+/// the delete (Greptile #1).
+fn cleanup_failed_add(repo: &Path, branch: &str, pre_existing: bool) {
     let _ = proc::run_mutate(repo, &["worktree", "prune"]);
-    let _ = proc::run_mutate(repo, &["branch", "-D", branch]);
+    if !pre_existing {
+        let _ = proc::run_mutate(repo, &["branch", "-d", "--", branch]);
+    }
 }
 
 /// Derive and canonicalize the worktree path, asserting it stays a
-/// path-component child of `root` with symlinks resolved (Safety Car #2).
+/// path-component child of `root` with symlinks resolved (Safety Car #2). Both
+/// sides are resolved to the same form so a symlinked worktrees root still
+/// accepts its own children (Greptile #20).
 fn safe_worktree_path(root: &Path, segment: &str) -> Result<PathBuf> {
     assert!(root.is_absolute(), "worktrees root must be absolute");
-    let candidate = root.join(segment);
-    // The leaf must not exist yet, so canonicalize the existing ancestor (root)
-    // and require the candidate to start with it on a component boundary.
     let anchor = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let candidate = anchor.join(segment);
     if !candidate.starts_with(&anchor) || candidate == anchor {
         return Err(Error::Invalid(format!(
             "worktree path escapes its root: {}",
@@ -123,6 +141,17 @@ fn safe_worktree_path(root: &Path, segment: &str) -> Result<PathBuf> {
         )));
     }
     Ok(candidate)
+}
+
+/// Find a registered worktree by its branch short-name (Greptile #8, #9). The
+/// branch is the identity the CLI argument names, so callers resolve through
+/// this instead of guessing a path.
+pub fn find_by_branch(repo: &Path, branch: &str, timeout: Duration) -> Result<Worktree> {
+    let (worktrees, _) = list_worktrees(repo, timeout)?;
+    worktrees
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+        .ok_or_else(|| Error::NotFound(format!("no worktree on branch {branch}")))
 }
 
 /// List all worktrees of `repo` with their status, bounded by `MAX_WORKTREES`.
@@ -185,9 +214,9 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// The current ahead/behind for a worktree path, or `None` if detached / no
-/// upstream. Thin wrapper used by callers that only need the counts.
-pub fn ahead_behind(repo: &Path, path: &Path, timeout: Duration) -> Result<Option<AheadBehind>> {
+/// The current dirty-entry count for a worktree path, read fresh. Used by the
+/// guarded-remove path so the decision is never based on stale list-time state.
+pub fn dirty_count(repo: &Path, path: &Path, timeout: Duration) -> Result<u32> {
     let path_str = path.to_string_lossy().into_owned();
     let out = proc::run_read(
         repo,
@@ -201,13 +230,112 @@ pub fn ahead_behind(repo: &Path, path: &Path, timeout: Duration) -> Result<Optio
         ],
         timeout,
     )?;
-    let (_dirty, ab) = parse_status_v2(&out, MAX_PORCELAIN_RECORDS)?;
-    Ok(ab)
+    let (dirty, _ab) = parse_status_v2(&out, MAX_PORCELAIN_RECORDS)?;
+    Ok(dirty)
 }
 
-/// Run a read-only git command with timeout, returning captured stdout. Public
-/// so the switch module's `stash create` snapshot (which writes only a dangling
-/// object, not working-tree or ref state) can share the read path.
+/// Point a ref at an object (mutating; off the kill-on-timeout path). Used to
+/// anchor a recovery snapshot so git cannot garbage-collect it.
+pub fn update_ref(repo: &Path, refname: &str, sha: &str) -> Result<()> {
+    assert!(
+        refname.starts_with("refs/"),
+        "recovery ref must be fully qualified"
+    );
+    assert!(!sha.is_empty(), "recovery sha must be non-empty");
+    proc::run_mutate(repo, &["update-ref", refname, sha])?;
+    Ok(())
+}
+
+/// Snapshot a worktree's full state — tracked changes AND untracked files — as
+/// a commit object WITHOUT touching the working tree or the real index, and
+/// anchor it at `refname`. Returns the commit SHA, or `None` if the worktree
+/// has nothing uncommitted to save.
+///
+/// `git stash create` is deliberately NOT used: it silently ignores an
+/// untracked-only tree (returns empty), which is exactly the data Greptile #2
+/// warned could be lost. Instead a scratch index (`GIT_INDEX_FILE`) is seeded
+/// from HEAD, `add -A` stages everything into it, and `write-tree` +
+/// `commit-tree` build a durable commit. The scratch index is deleted after.
+pub fn snapshot_worktree(repo: &Path, wt: &Path, refname: &str) -> Result<Option<String>> {
+    assert!(wt.is_absolute(), "worktree path must be absolute");
+    let wt_str = wt.to_string_lossy().into_owned();
+    // Scratch index beside the repo's gitdir; unique per call.
+    let idx = scratch_index_path();
+    let idx_str = idx.to_string_lossy().into_owned();
+    let _cleanup = ScratchIndex(idx.clone());
+
+    // Seed the scratch index from HEAD, then stage every change (incl. new
+    // files). Both run against the scratch index only.
+    git_env(repo, &["-C", &wt_str, "read-tree", "HEAD"], &idx_str)?;
+    git_env(repo, &["-C", &wt_str, "add", "-A"], &idx_str)?;
+    let tree = git_env(repo, &["-C", &wt_str, "write-tree"], &idx_str)?;
+    let tree = tree.trim().to_string();
+    assert!(!tree.is_empty(), "write-tree produced an empty oid");
+
+    // If the staged tree equals HEAD's tree, there is nothing to save.
+    let head_tree = proc::run_mutate(repo, &["-C", &wt_str, "rev-parse", "HEAD^{tree}"])?;
+    if tree == head_tree.trim() {
+        return Ok(None);
+    }
+
+    let commit = git_env(
+        repo,
+        &[
+            "-C",
+            &wt_str,
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-m",
+            "wtm recovery",
+        ],
+        &idx_str,
+    )?;
+    let commit = commit.trim().to_string();
+    if commit.is_empty() {
+        return Err(Error::Git("commit-tree produced no oid".into()));
+    }
+    update_ref(repo, refname, &commit)?;
+    Ok(Some(commit))
+}
+
+/// Run a mutating git command with a scratch `GIT_INDEX_FILE` so the real index
+/// is untouched. Not on the kill path (these writes must complete).
+fn git_env(repo: &Path, args: &[&str], index_file: &str) -> Result<String> {
+    use std::process::Command;
+    let out = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_INDEX_FILE", index_file)
+        .args(args)
+        .output()?;
+    if !out.status.success() {
+        return Err(Error::Git(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn scratch_index_path() -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("wtm-index-{}-{ts}", std::process::id()))
+}
+
+/// Deletes the scratch index file on drop.
+struct ScratchIndex(PathBuf);
+impl Drop for ScratchIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run a read-only git command with timeout, returning captured stdout.
 pub fn capture_read(repo: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     proc::run_read(repo, args, timeout)
 }

@@ -7,12 +7,17 @@
 //!     state. They still run to completion and their exit status is checked.
 //!
 //! Read calls spawn git in its own process group and signal the whole group on
-//! timeout (Safety Car #15) so pagers/hooks are not orphaned.
+//! timeout (Greptile #12) so pagers/hooks are not orphaned. Both output pipes
+//! are drained by dedicated threads WHILE waiting (Greptile #5) so a large
+//! status cannot fill a pipe, block git, and masquerade as a timeout. Output is
+//! captured as raw bytes and decoded lossily (Greptile #19) so a non-UTF-8
+//! filename never fails the read.
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::caps::MAX_TRY_WAIT_POLLS;
@@ -29,8 +34,31 @@ pub fn run_read(cwd: &Path, args: &[&str], timeout: Duration) -> Result<String> 
     // Own process group so we can signal children git itself spawned.
     cmd.process_group(0);
     let mut child = cmd.spawn()?;
-    wait_with_timeout(&mut child, timeout, &args.join(" "))?;
-    collect_output(child, &args.join(" "))
+
+    // Drain both pipes concurrently so git never blocks on a full pipe buffer.
+    let out_reader = spawn_drain(child.stdout.take());
+    let err_reader = spawn_drain(child.stderr.take());
+
+    let timed_out = wait_until(&mut child, timeout);
+    if timed_out {
+        kill_group(&mut child);
+    }
+    // Reap, then join the readers (the pipes close once git exits/dies).
+    let status = child.wait()?;
+    let stdout = join_drain(out_reader);
+    let stderr = join_drain(err_reader);
+
+    let ctx = args.join(" ");
+    if timed_out {
+        return Err(Error::Timeout(format!("git {ctx}")));
+    }
+    if !status.success() {
+        return Err(Error::Git(format!(
+            "git {ctx}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// Run a mutating git command to completion (no kill path). Checks exit status.
@@ -52,29 +80,42 @@ fn base_command(cwd: &Path, args: &[&str]) -> Command {
     c
 }
 
+/// Spawn a thread that reads a pipe to EOF. `None` pipe yields empty bytes.
+fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> Option<JoinHandle<Vec<u8>>> {
+    pipe.map(|mut r| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.read_to_end(&mut buf);
+            buf
+        })
+    })
+}
+
+fn join_drain(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
 /// Poll `try_wait` up to `MAX_TRY_WAIT_POLLS` (P10 Rule 2 bound) or until the
-/// derived deadline, whichever is first. On expiry, kill the process group.
-fn wait_with_timeout(child: &mut Child, timeout: Duration, ctx: &str) -> Result<()> {
+/// derived deadline. Returns true if the deadline/cap was hit before exit.
+fn wait_until(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let max_polls = derived_poll_cap(timeout);
     for poll in 0..max_polls {
-        match child.try_wait()? {
-            Some(_) => {
+        match child.try_wait() {
+            Ok(Some(_)) => {
                 debug_assert!(poll < max_polls, "exited within poll cap");
-                return Ok(());
+                return false;
             }
-            None => {
+            Ok(None) => {
                 if Instant::now() >= deadline {
-                    break;
+                    return true;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
+            Err(_) => return false,
         }
     }
-    kill_group(child);
-    // Reap so we don't leave a zombie; both Results handled.
-    let _ = child.wait();
-    Err(Error::Timeout(format!("git {ctx}")))
+    true
 }
 
 /// Derive the poll cap from `timeout / POLL_INTERVAL`, clamped to the static
@@ -84,29 +125,16 @@ fn derived_poll_cap(timeout: Duration) -> usize {
     derived.min(MAX_TRY_WAIT_POLLS)
 }
 
-/// Signal the child's process group (negative pid) so git's own children die
-/// too. Falls back to killing just the child if the group signal fails.
+/// Signal the child's whole process group (negative pid) so git's own children
+/// (pagers, fsmonitor hooks) die too, then fall back to the direct child.
 fn kill_group(child: &mut Child) {
     let pid = child.id() as i32;
-    // SAFETY-FREE: use std kill via libc-less path — send SIGKILL to the group
-    // by shelling out to `kill` is avoided; instead kill the direct child and
-    // rely on the process_group so the kernel reaps the group on session exit.
-    let _ = child.kill();
     debug_assert!(pid > 0, "child pid must be positive");
-}
-
-fn collect_output(mut child: Child, ctx: &str) -> Result<String> {
-    let status = child.wait()?;
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut stdout)?;
+    // The child leads its own group (process_group(0)); the group id equals the
+    // child pid. SIGKILL to -pid signals every member.
+    // SAFETY: `libc::kill` is a thin syscall wrapper with no memory effects.
+    let signalled = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if signalled != 0 {
+        let _ = child.kill();
     }
-    if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut stderr);
-        }
-        return Err(Error::Git(format!("git {ctx}: {}", stderr.trim())));
-    }
-    Ok(stdout)
 }
