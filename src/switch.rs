@@ -157,16 +157,14 @@ fn fresh_dirty(repo: &Path, path: &Path, timeout: Duration) -> Result<bool> {
 /// is clobbered (Greptile #2, #3 + follow-ups). Returns `None` only when there
 /// is genuinely nothing uncommitted to save.
 fn snapshot(repo: &Path, wt: &Worktree) -> Result<Option<Snap>> {
-    let snap = if dirty {
-        match snapshot(repo, wt) {
-            Ok(Some(s)) => Some(s),
-            Ok(None) if confirm_unrecoverable => None,
-            Ok(None) => {
-                return Err(Error::Invalid(
-                    "dirty worktree could not be represented in a recovery snapshot; pass --confirm-unrecoverable to accept data loss".into(),
-                ));
-            }
-            Err(e) if confirm_unrecoverable => None,
+fn snapshot(repo: &Path, wt: &Worktree) -> Result<Option<Snap>> {
+    let Some(sha) = git::snapshot_commit(repo, &wt.path)? else {
+        return Ok(None);
+    };
+    let base = recovery_ref_base(wt);
+    let refname = git::create_recovery_ref(repo, &base, &sha)?;
+    Ok(Some(Snap { refname, sha }))
+}
             Err(e) => return Err(e),
         }
     } else {
