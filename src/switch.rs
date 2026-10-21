@@ -106,12 +106,12 @@ pub fn guarded_remove(
         ));
     }
 
-    // Snapshot uncommitted work (tracked AND untracked) to a durable ref BEFORE
-    // removal (Greptile #2, #3, #7). If a snapshot can't be made and the user
-    // did not accept the loss, refuse.
-    let stash_ref = if dirty {
-        match snapshot(repo, wt, timeout) {
-            Ok(r) => Some(r),
+    // Snapshot uncommitted work (tracked, untracked, AND staged) to a durable,
+    // uniquely-named ref BEFORE removal (Greptile #2, #3, #7 + follow-ups). If
+    // the snapshot genuinely fails and the user did not accept the loss, refuse.
+    let snap = if dirty {
+        match snapshot(repo, wt) {
+            Ok(s) => s,
             Err(_) if confirm_unrecoverable => None,
             Err(e) => return Err(e),
         }
@@ -119,19 +119,27 @@ pub fn guarded_remove(
         None
     };
 
-    // Record the recovery entry first; the ref already protects the data.
+    // Record the recovery entry first; the ref + commit already protect the
+    // data. The log stores the COMMIT SHA (not just the ref) so the entry is
+    // never ambiguous even if a ref is later moved (Greptile #2 follow-up).
     recovery::record(
         log_path,
         &Entry {
             branch: wt.branch.as_deref().unwrap_or("(detached)"),
-            sha: &wt.head,
+            sha: snap.as_ref().map(|s| s.sha.as_str()).unwrap_or(&wt.head),
             path: &wt.path,
-            stash_ref: stash_ref.as_deref(),
+            stash_ref: snap.as_ref().map(|s| s.refname.as_str()),
         },
     )?;
 
     git::remove_worktree(repo, &wt.path, force)?;
     Ok(())
+}
+
+/// A recovery snapshot: the durable ref created and the commit SHA it points at.
+struct Snap {
+    refname: String,
+    sha: String,
 }
 
 /// Read the worktree's current dirty state, failing closed: an unreadable
@@ -144,22 +152,22 @@ fn fresh_dirty(repo: &Path, path: &Path, timeout: Duration) -> Result<bool> {
     }
 }
 
-/// Snapshot uncommitted work (tracked AND untracked) to a durable ref so git
-/// cannot GC it (Greptile #2, #3). Delegates to `git::snapshot_worktree`, which
-/// uses a scratch index + `commit-tree` so untracked-only state is captured too
-/// (plain `stash create` would silently drop it). Returns the ref name, or an
-/// error if there was genuinely nothing to snapshot. `timeout` is unused here
-/// because snapshot steps are mutating and run to completion off the kill path.
-fn snapshot(repo: &Path, wt: &Worktree, _timeout: Duration) -> Result<String> {
-    let refname = recovery_ref_name(wt);
-    match git::snapshot_worktree(repo, &wt.path, &refname)? {
-        Some(_sha) => Ok(refname),
-        None => Err(Error::Git("nothing to snapshot".into())),
-    }
+/// Snapshot uncommitted work (working tree, untracked, AND the real index) to a
+/// durable, uniquely-named ref so git cannot GC it and no earlier recovery copy
+/// is clobbered (Greptile #2, #3 + follow-ups). Returns `None` only when there
+/// is genuinely nothing uncommitted to save.
+fn snapshot(repo: &Path, wt: &Worktree) -> Result<Option<Snap>> {
+    let Some(sha) = git::snapshot_commit(repo, &wt.path)? else {
+        return Ok(None);
+    };
+    let base = recovery_ref_base(wt);
+    let refname = git::create_recovery_ref(repo, &base, &sha)?;
+    Ok(Some(Snap { refname, sha }))
 }
 
-/// A unique, legal recovery ref name for a worktree.
-fn recovery_ref_name(wt: &Worktree) -> String {
+/// A stable base for a worktree's recovery refs; `create_recovery_ref` appends a
+/// unique, collision-free suffix.
+fn recovery_ref_base(wt: &Worktree) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

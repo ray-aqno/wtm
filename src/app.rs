@@ -10,7 +10,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -37,6 +39,9 @@ pub struct App {
     pub watch_mode: WatchMode,
     pub selected: usize,
     pub table_state: TableState,
+    /// Last refresh error, shown in the header so a failed/stale scan is never
+    /// silently presented as success (Greptile, follow-up P2).
+    pub status_msg: Option<String>,
 }
 
 impl App {
@@ -49,15 +54,26 @@ impl App {
             watch_mode,
             selected: 0,
             table_state: TableState::default(),
+            status_msg: None,
         }
     }
 
-    /// Replace the rendered state with a freshly computed snapshot.
-    fn apply(&mut self, snap: Snapshot) {
-        self.worktrees = snap.worktrees;
-        self.truncated = snap.truncated;
-        if !self.worktrees.is_empty() && self.selected >= self.worktrees.len() {
-            self.selected = self.worktrees.len() - 1;
+    /// Apply a completed refresh result. On success, replace the rendered state
+    /// and clear any error; on failure, keep the old rows but surface the error
+    /// so stale data is never shown as current.
+    fn apply(&mut self, result: Result<Snapshot>) {
+        match result {
+            Ok(snap) => {
+                self.worktrees = snap.worktrees;
+                self.truncated = snap.truncated;
+                self.status_msg = None;
+                if !self.worktrees.is_empty() && self.selected >= self.worktrees.len() {
+                    self.selected = self.worktrees.len() - 1;
+                }
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("refresh failed: {e}"));
+            }
         }
     }
 
@@ -90,48 +106,63 @@ fn load_state(repo: &Path, config: &Config) -> Result<Snapshot> {
 }
 
 /// Background refresh worker: on each request it recomputes a snapshot and sends
-/// it back. Lives for the duration of the dashboard; exits when the request
-/// channel disconnects (the app quit) — a clean shutdown, not an error.
+/// the result (Ok or Err) back. Lives for the duration of the dashboard; exits
+/// when the request channel disconnects (the app quit) — a clean shutdown.
+///
+/// Requests are coalesced: an `in_flight` flag ensures at most one refresh is
+/// queued at a time, so bursts of filesystem events during a slow scan do not
+/// pile up redundant git work (Greptile, follow-up P2).
 struct Loader {
     request: Sender<()>,
-    result: Receiver<Snapshot>,
+    result: Receiver<Result<Snapshot>>,
+    in_flight: Arc<AtomicBool>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl Loader {
     fn spawn(repo: PathBuf, config: Config) -> Loader {
         let (req_tx, req_rx) = mpsc::channel::<()>();
-        let (res_tx, res_rx) = mpsc::channel::<Snapshot>();
+        let (res_tx, res_rx) = mpsc::channel::<Result<Snapshot>>();
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let worker_flag = in_flight.clone();
         let handle = std::thread::spawn(move || {
-            // Bounded only by the lifetime of the request channel: each recv
-            // blocks until a request or disconnect. Not a busy loop.
+            // Each recv blocks until a request or disconnect; not a busy loop.
             while req_rx.recv().is_ok() {
-                if let Ok(snap) = load_state(&repo, &config) {
-                    // Receiver gone => app quit; stop.
-                    if res_tx.send(snap).is_err() {
-                        break;
-                    }
+                let res = load_state(&repo, &config);
+                // Clear the flag before sending so a new request can queue.
+                worker_flag.store(false, Ordering::SeqCst);
+                if res_tx.send(res).is_err() {
+                    break; // receiver gone => app quit.
                 }
             }
         });
         Loader {
             request: req_tx,
             result: res_rx,
+            in_flight,
             _handle: handle,
         }
     }
 
-    /// Ask for a refresh; ignore a full/broken channel (a refresh is already
-    /// in flight or the worker is gone).
+    /// Request a refresh, coalescing: if one is already queued/running, this is
+    /// a no-op so bursty events cannot stack up redundant scans.
     fn request(&self) {
-        let _ = self.request.send(());
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            && self.request.send(()).is_err()
+        {
+            // Worker gone; undo the flag so state stays consistent.
+            self.in_flight.store(false, Ordering::SeqCst);
+        }
     }
 
-    /// Take the most recent completed snapshot, if any (drains the channel).
-    fn take_latest(&self) -> Option<Snapshot> {
+    /// Take the most recent completed result, if any (drains the channel).
+    fn take_latest(&self) -> Option<Result<Snapshot>> {
         let mut latest = None;
-        while let Ok(snap) = self.result.try_recv() {
-            latest = Some(snap);
+        while let Ok(res) = self.result.try_recv() {
+            latest = Some(res);
         }
         latest
     }
@@ -144,19 +175,19 @@ pub fn run(repo: &Path, config: Config) -> Result<()> {
     let watch_mode = refresher.mode;
 
     let loader = Loader::spawn(repo.to_path_buf(), config.clone());
-    // Kick off the initial load and wait briefly for the first snapshot so the
-    // first frame is populated.
+    // Kick off the initial load and wait briefly for the first result so the
+    // first frame is populated. If the very first load errors, surface it rather
+    // than showing a bogus empty dashboard (Greptile, follow-up P2).
     loader.request();
     let initial = wait_initial(&loader, Duration::from_millis(config.git_timeout_ms));
+    let (worktrees, truncated, status_msg) = match initial {
+        Some(Ok(snap)) => (snap.worktrees, snap.truncated, None),
+        Some(Err(e)) => return Err(e),
+        None => (Vec::new(), false, Some("loading…".to_string())),
+    };
 
-    let mut app = App::for_render(
-        initial
-            .as_ref()
-            .map(|s| s.worktrees.clone())
-            .unwrap_or_default(),
-        initial.as_ref().map(|s| s.truncated).unwrap_or(false),
-        watch_mode,
-    );
+    let mut app = App::for_render(worktrees, truncated, watch_mode);
+    app.status_msg = status_msg;
 
     let mut terminal = setup_terminal()?;
     let outcome = event_loop(&mut terminal, &mut app, refresher, &loader);
@@ -165,12 +196,12 @@ pub fn run(repo: &Path, config: Config) -> Result<()> {
     outcome
 }
 
-/// Block up to `timeout` for the first snapshot so startup isn't blank.
-fn wait_initial(loader: &Loader, timeout: Duration) -> Option<Snapshot> {
+/// Block up to `timeout` for the first refresh result so startup isn't blank.
+fn wait_initial(loader: &Loader, timeout: Duration) -> Option<Result<Snapshot>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Some(snap) = loader.take_latest() {
-            return Some(snap);
+        if let Some(res) = loader.take_latest() {
+            return Some(res);
         }
         std::thread::sleep(Duration::from_millis(10));
     }

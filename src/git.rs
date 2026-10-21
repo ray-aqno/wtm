@@ -234,70 +234,113 @@ pub fn dirty_count(repo: &Path, path: &Path, timeout: Duration) -> Result<u32> {
     Ok(dirty)
 }
 
-/// Point a ref at an object (mutating; off the kill-on-timeout path). Used to
-/// anchor a recovery snapshot so git cannot garbage-collect it.
-pub fn update_ref(repo: &Path, refname: &str, sha: &str) -> Result<()> {
-    assert!(
-        refname.starts_with("refs/"),
-        "recovery ref must be fully qualified"
-    );
-    assert!(!sha.is_empty(), "recovery sha must be non-empty");
-    proc::run_mutate(repo, &["update-ref", refname, sha])?;
-    Ok(())
-}
-
-/// Snapshot a worktree's full state — tracked changes AND untracked files — as
-/// a commit object WITHOUT touching the working tree or the real index, and
-/// anchor it at `refname`. Returns the commit SHA, or `None` if the worktree
-/// has nothing uncommitted to save.
+/// Build a recovery commit capturing a worktree's FULL uncommitted state —
+/// working-tree changes, untracked files, AND the real index — without touching
+/// the working tree, the real index, or any ref. Returns the dangling commit
+/// SHA, or `None` if there is nothing uncommitted to save. The caller anchors it
+/// at a unique ref (see `create_recovery_ref`).
 ///
-/// `git stash create` is deliberately NOT used: it silently ignores an
-/// untracked-only tree (returns empty), which is exactly the data Greptile #2
-/// warned could be lost. Instead a scratch index (`GIT_INDEX_FILE`) is seeded
-/// from HEAD, `add -A` stages everything into it, and `write-tree` +
-/// `commit-tree` build a durable commit. The scratch index is deleted after.
-pub fn snapshot_worktree(repo: &Path, wt: &Path, refname: &str) -> Result<Option<String>> {
+/// `git stash create` is deliberately NOT used: it drops an untracked-only tree.
+/// Two trees are captured so nothing is lost even when staged content differs
+/// from the working copy (Greptile #1, follow-up): the working tree becomes the
+/// recovery commit's tree, and the real index is committed as an extra parent so
+/// its tree stays reachable from the ref.
+pub fn snapshot_commit(repo: &Path, wt: &Path) -> Result<Option<String>> {
     assert!(wt.is_absolute(), "worktree path must be absolute");
     let wt_str = wt.to_string_lossy().into_owned();
-    // Scratch index beside the repo's gitdir; unique per call.
+    let head_tree = proc::run_mutate(repo, &["-C", &wt_str, "rev-parse", "HEAD^{tree}"])?
+        .trim()
+        .to_string();
+
+    // Tree 1: the real index (staged content), read with the worktree's own
+    // index (no GIT_INDEX_FILE override).
+    let index_tree = proc::run_mutate(repo, &["-C", &wt_str, "write-tree"])?
+        .trim()
+        .to_string();
+    assert!(
+        !index_tree.is_empty(),
+        "index write-tree produced empty oid"
+    );
+
+    // Tree 2: the working tree incl. untracked, via a scratch index.
     let idx = scratch_index_path();
     let idx_str = idx.to_string_lossy().into_owned();
     let _cleanup = ScratchIndex(idx.clone());
-
-    // Seed the scratch index from HEAD, then stage every change (incl. new
-    // files). Both run against the scratch index only.
     git_env(repo, &["-C", &wt_str, "read-tree", "HEAD"], &idx_str)?;
     git_env(repo, &["-C", &wt_str, "add", "-A"], &idx_str)?;
-    let tree = git_env(repo, &["-C", &wt_str, "write-tree"], &idx_str)?;
-    let tree = tree.trim().to_string();
-    assert!(!tree.is_empty(), "write-tree produced an empty oid");
+    let work_tree = git_env(repo, &["-C", &wt_str, "write-tree"], &idx_str)?
+        .trim()
+        .to_string();
+    assert!(!work_tree.is_empty(), "work write-tree produced empty oid");
 
-    // If the staged tree equals HEAD's tree, there is nothing to save.
-    let head_tree = proc::run_mutate(repo, &["-C", &wt_str, "rev-parse", "HEAD^{tree}"])?;
-    if tree == head_tree.trim() {
+    // Nothing staged and nothing in the working tree differs from HEAD.
+    if work_tree == head_tree && index_tree == head_tree {
         return Ok(None);
     }
 
+    // Commit the index tree (extra parent) so staged content stays reachable.
+    let index_commit = proc::run_mutate(
+        repo,
+        &[
+            "-C",
+            &wt_str,
+            "commit-tree",
+            &index_tree,
+            "-p",
+            "HEAD",
+            "-m",
+            "wtm recovery (index)",
+        ],
+    )?
+    .trim()
+    .to_string();
+
+    // Recovery commit: tree = working tree; parents = HEAD + index commit.
     let commit = git_env(
         repo,
         &[
             "-C",
             &wt_str,
             "commit-tree",
-            &tree,
+            &work_tree,
             "-p",
             "HEAD",
+            "-p",
+            &index_commit,
             "-m",
             "wtm recovery",
         ],
         &idx_str,
-    )?;
-    let commit = commit.trim().to_string();
+    )?
+    .trim()
+    .to_string();
     if commit.is_empty() {
         return Err(Error::Git("commit-tree produced no oid".into()));
     }
-    update_ref(repo, refname, &commit)?;
     Ok(Some(commit))
+}
+
+/// Create a durable ref pointing at `sha` under `base`, choosing a suffix that
+/// does not already exist and creating it atomically (create-only), so a second
+/// snapshot can never overwrite an earlier recovery copy (Greptile #2,
+/// follow-up). Returns the ref name actually created.
+pub fn create_recovery_ref(repo: &Path, base: &str, sha: &str) -> Result<String> {
+    assert!(
+        base.starts_with("refs/"),
+        "recovery ref base must be qualified"
+    );
+    assert!(!sha.is_empty(), "recovery sha must be non-empty");
+    // Bounded search for a free suffix (P10 Rule 2).
+    const MAX_SUFFIX: u32 = 1000;
+    for n in 0..MAX_SUFFIX {
+        let refname = format!("{base}-{n}");
+        // `update-ref <ref> <new> ""` requires the ref to NOT already exist;
+        // it fails otherwise, so we never clobber an existing recovery copy.
+        if proc::run_mutate(repo, &["update-ref", &refname, sha, ""]).is_ok() {
+            return Ok(refname);
+        }
+    }
+    Err(Error::Git("no free recovery ref suffix".into()))
 }
 
 /// Run a mutating git command with a scratch `GIT_INDEX_FILE` so the real index

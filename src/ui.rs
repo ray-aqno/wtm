@@ -39,6 +39,9 @@ fn header_line(app: &App) -> Line<'static> {
     if app.truncated {
         text.push_str("  ⚠ list truncated — results incomplete");
     }
+    if let Some(msg) = &app.status_msg {
+        text.push_str(&format!("  ⚠ {msg}"));
+    }
     Line::from(text)
 }
 

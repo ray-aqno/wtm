@@ -202,3 +202,72 @@ fn large_status_output_does_not_false_timeout() {
     );
     assert!(wts[0].dirty_count >= 4000, "all untracked files counted");
 }
+
+#[test]
+fn snapshot_captures_both_staged_and_working_versions() {
+    // Greptile follow-up #1: stage version A of a file, then overwrite the
+    // working copy with version B. The recovery commit must preserve BOTH:
+    // its tree carries B, and its index-parent carries A.
+    let repo = init_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let wtr = wt_root_dir();
+    let wt_root = wtr.path().canonicalize().unwrap();
+    let path = git::add_worktree(&root, &wt_root, "twover").unwrap();
+
+    let file = path.join("tracked.txt");
+    std::fs::write(&file, "VERSION_A").unwrap();
+    run(&path, &["add", "tracked.txt"]); // stage A
+    std::fs::write(&file, "VERSION_B").unwrap(); // working copy now B
+
+    let sha = git::snapshot_commit(&root, &path)
+        .unwrap()
+        .expect("something to snapshot");
+
+    // Recovery commit's own tree carries the working version B.
+    let work = Command::new("git")
+        .current_dir(&root)
+        .args(["show", &format!("{sha}:tracked.txt")])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&work.stdout),
+        "VERSION_B",
+        "working version saved"
+    );
+
+    // Its index-parent (second parent) carries the staged version A.
+    let staged = Command::new("git")
+        .current_dir(&root)
+        .args(["show", &format!("{sha}^2:tracked.txt")])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout),
+        "VERSION_A",
+        "staged version saved"
+    );
+}
+
+#[test]
+fn recovery_refs_are_unique_per_snapshot() {
+    // Greptile follow-up #2: two snapshots of the same path must not clobber
+    // each other; create_recovery_ref picks a fresh suffix each time.
+    let repo = init_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let base = "refs/wtm-recovery/same-base";
+    // Two distinct blob-ish SHAs: use HEAD and an index commit of HEAD.
+    let head = {
+        let o = Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let r1 = git::create_recovery_ref(&root, base, &head).unwrap();
+    let r2 = git::create_recovery_ref(&root, base, &head).unwrap();
+    assert_ne!(
+        r1, r2,
+        "second recovery ref must not reuse the first's name"
+    );
+}
