@@ -334,10 +334,12 @@ pub fn create_recovery_ref(repo: &Path, base: &str, sha: &str) -> Result<String>
     const MAX_SUFFIX: u32 = 1000;
     for n in 0..MAX_SUFFIX {
         let refname = format!("{base}-{n}");
-        // `update-ref <ref> <new> ""` requires the ref to NOT already exist;
-        // it fails otherwise, so we never clobber an existing recovery copy.
-        if proc::run_mutate(repo, &["update-ref", &refname, sha, ""]).is_ok() {
-            return Ok(refname);
+        // `update-ref <ref> <new> ""` succeeds only when the ref does not
+        // already exist, so a collision is safe to retry with another suffix.
+        match proc::run_mutate(repo, &["update-ref", &refname, sha, ""]) {
+            Ok(_) => return Ok(refname),
+            Err(Error::Git(message)) if message.contains("reference already exists") => {}
+            Err(error) => return Err(error),
         }
     }
     Err(Error::Git("no free recovery ref suffix".into()))
