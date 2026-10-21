@@ -146,16 +146,29 @@ impl Loader {
 
     /// Request a refresh, coalescing: if one is already queued/running, this is
     /// a no-op so bursty events cannot stack up redundant scans.
-struct RefreshState {
-    running: bool,
-    pending: bool,
-}
+    /// Request a refresh, coalescing: if one is already queued/running, this is
+    /// a no-op so bursty events cannot stack up redundant scans.
+    fn request(&self) {
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            if self.request.send(()).is_err() {
+                // Worker gone; undo the flag so state stays consistent.
+                self.in_flight.store(false, Ordering::SeqCst);
+            }
+        }
+    }
 
-struct Loader {
-    request: Sender<()>,
-    result: Receiver<Result<Snapshot>>,
-    state: Arc<Mutex<RefreshState>>,
-    _handle: std::thread::JoinHandle<()>,
+    /// Take the most recent completed result, if any (drains the channel).
+    fn take_latest(&self) -> Option<Result<Snapshot>> {
+        let mut latest = None;
+        while let Ok(res) = self.result.try_recv() {
+            latest = Some(res);
+        }
+        latest
+    }
 }
         {
             // Worker gone; undo the flag so state stays consistent.
